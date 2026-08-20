@@ -3,21 +3,31 @@
     ==========================================
     Archivo único para la pestaña Classic.
 
-    Incluye:
-      1. HideGuis: oculta/restaura las GUIs y la top bar.
-      2. FOVAdjust: permite ajustar el FOV de la cámara.
+    Cada módulo se registra en ModuleFactories con una clave propia y devuelve
+    su función de parada. El manifest puede crear un toggle por módulo usando
+    el mismo archivo y una clave distinta. La librería coloca
+    _G["_YY_CLASSIC_LOADING_KEY"] antes de ejecutar este archivo.
 
-    El manifest remoto crea un solo toggle con la clave ClassicOptions.
-    Este archivo registra _G["_YY_STOP_ClassicOptions"] para que el toggle
-    pueda detener ambas funciones y limpiar sus interfaces.
+    Para agregar una opción futura:
+      1. Crear local function registerNuevaOpcion() ... return stop end.
+      2. Añadir NuevaOpcion = registerNuevaOpcion a ModuleFactories.
+      3. Añadir al manifest la entrada con key = "NuevaOpcion".
+    La librería no necesita modificarse.
 ]]
 
--- Detener una instancia consolidada anterior antes de crear otra.
-if _G["_YY_STOP_ClassicOptions"] then
-    pcall(_G["_YY_STOP_ClassicOptions"])
+local requestedModule = rawget(_G, "_YY_CLASSIC_LOADING_KEY")
+
+-- Detener la instancia anterior del módulo que se va a recargar.
+if requestedModule and requestedModule ~= "" then
+    local previousStop = _G["_YY_STOP_" .. tostring(requestedModule)]
+    if previousStop then pcall(previousStop) end
+else
+    if _G["_YY_STOP_ClassicOptions"] then
+        pcall(_G["_YY_STOP_ClassicOptions"])
+    end
 end
 
-do
+local function registerHideGuis()
 --[[
     ════════════════════════════════════════════════════════════════════════
     YINYANG EXTERNAL SCRIPT — HideGuis
@@ -275,14 +285,14 @@ end)
 -- La librería llama a _G["_YY_STOP_HideGuis"]() al presionar el botón por segunda vez.
 -- Restaura las GUIs si estaban ocultas, destruye esta GUI y limpia el registro.
 -- ════════════════════════════════════════════════════════════════════════
-hideGuisStop = function()
+return function()
     if hidden then showAll() end
     pcall(function() gui:Destroy() end)
 end
 
 end
 
-do
+local function registerFOVAdjust()
 --[[
     ════════════════════════════════════════════════════════════════════════
     YINYANG EXTERNAL SCRIPT — FOVAdjust
@@ -534,7 +544,7 @@ end)
 -- ════════════════════════════════════════════════════════════════════════
 -- REGISTRO DE FUNCIÓN DE PARADA — requerido por el sistema de scripts externos
 -- ════════════════════════════════════════════════════════════════════════
-fovAdjustStop = function()
+return function()
     local camera = Workspace.CurrentCamera
     if camera then camera.FieldOfView = DEFAULT_FOV end
     pcall(function() gui:Destroy() end)
@@ -542,12 +552,60 @@ end
 
 end
 
-_G["_YY_STOP_ClassicOptions"] = function()
-    pcall(function()
-        if hideGuisStop then hideGuisStop() end
-    end)
-    pcall(function()
-        if fovAdjustStop then fovAdjustStop() end
-    end)
-    _G["_YY_STOP_ClassicOptions"] = nil
+local ModuleFactories = {
+    HideGuis = registerHideGuis,
+    FOVAdjust = registerFOVAdjust,
+}
+
+local activeStops = {}
+local function activateModule(moduleKey)
+    local factory = ModuleFactories[moduleKey]
+    if type(factory) ~= "function" then
+        warn("[YinYang Classic] Módulo no registrado: " .. tostring(moduleKey))
+        return false
+    end
+
+    local ok, stop = pcall(factory)
+    if not ok then
+        warn("[YinYang Classic] Error al iniciar " .. tostring(moduleKey) .. ": " .. tostring(stop))
+        return false
+    end
+    if type(stop) ~= "function" then
+        warn("[YinYang Classic] El módulo " .. tostring(moduleKey) .. " no devolvió una función de parada")
+        return false
+    end
+
+    activeStops[moduleKey] = stop
+    return true
+end
+
+if requestedModule and requestedModule ~= "" then
+    activateModule(tostring(requestedModule))
+else
+    for moduleKey in pairs(ModuleFactories) do
+        activateModule(moduleKey)
+    end
+end
+
+local function stopModule(moduleKey)
+    local stop = activeStops[moduleKey]
+    if stop then
+        pcall(stop)
+        activeStops[moduleKey] = nil
+    end
+    _G["_YY_STOP_" .. tostring(moduleKey)] = nil
+end
+
+if requestedModule and requestedModule ~= "" then
+    local moduleKey = tostring(requestedModule)
+    _G["_YY_STOP_" .. moduleKey] = function()
+        stopModule(moduleKey)
+    end
+else
+    _G["_YY_STOP_ClassicOptions"] = function()
+        for moduleKey in pairs(activeStops) do
+            stopModule(moduleKey)
+        end
+        _G["_YY_STOP_ClassicOptions"] = nil
+    end
 end
