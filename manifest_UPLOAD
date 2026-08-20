@@ -1,0 +1,8 @@
+return {
+    {
+        es = "Opciones Classic",
+        en = "Classic Options",
+        file = "YinYang_ClassicOptions.lua",
+        key = "ClassicOptions",
+    },
+}
