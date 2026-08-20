@@ -1,8 +1,14 @@
 return {
     {
-        es = "Opciones Classic",
-        en = "Classic Options",
+        es = "Ocultar GUIs",
+        en = "Hide GUIs",
         file = "YinYang_ClassicOptions.lua",
-        key = "ClassicOptions",
+        key = "HideGuis",
+    },
+    {
+        es = "Ajustar FOV",
+        en = "Adjust FOV",
+        file = "YinYang_ClassicOptions.lua",
+        key = "FOVAdjust",
     },
 }
