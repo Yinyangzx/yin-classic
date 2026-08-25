@@ -552,9 +552,442 @@ end
 
 end
 
+local function registerWaypoint()
+-- Waypoint — estilo HideGuis-7.lua
+-- GUI local, movible y visualmente consistente con el pill/glass Yin Yang.
+-- Guarda el CFrame del HumanoidRootPart actual y permite volver al último punto.
+-- No modifica HideGuis ni la librería Yin Yang.
+
+local Players       = game:GetService("Players")
+local UIS           = game:GetService("UserInputService")
+local TweenService  = game:GetService("TweenService")
+local lp            = Players.LocalPlayer
+local pg            = lp:WaitForChild("PlayerGui")
+
+local GUI_NAME = "_WaypointHideGuisStyle"
+local MARKER_NAME = "__YY_LocalWaypointMarker"
+
+-- Limpiar únicamente una ejecución anterior de este script.
+local previousGui = pg:FindFirstChild(GUI_NAME)
+if previousGui then
+    pcall(function() previousGui:Destroy() end)
+end
+local previousMarker = workspace:FindFirstChild(MARKER_NAME)
+if previousMarker then
+    pcall(function() previousMarker:Destroy() end)
+end
+
+-- Paleta oscurecida (más contraste, menos gris medio).
+local BG        = Color3.fromRGB(16, 16, 20)
+local ACCENT    = Color3.fromRGB(255, 255, 255)
+local ON_COLOR  = Color3.fromRGB(52, 199, 89)
+local TEXT      = Color3.fromRGB(240, 240, 240)
+local DIM_TEXT  = Color3.fromRGB(190, 193, 202)
+local SAVE_BLUE = Color3.fromRGB(35, 50, 85)
+local RETURN_RED = Color3.fromRGB(65, 32, 42)
+local AUTOTP_COLOR = Color3.fromRGB(45, 35, 70)
+
+local gui = Instance.new("ScreenGui")
+gui.Name = GUI_NAME
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 9999
+gui.Parent = pg
+
+local panel = Instance.new("Frame")
+panel.Name = "WaypointPanel"
+panel.Size = UDim2.fromOffset(200, 142)
+panel.Position = UDim2.new(0, 20, 0, 105)
+panel.BackgroundColor3 = BG
+panel.BackgroundTransparency = 0.22
+panel.BorderSizePixel = 0
+panel.ZIndex = 2
+panel.Parent = gui
+
+local panelCorner = Instance.new("UICorner")
+panelCorner.CornerRadius = UDim.new(0, 13)
+panelCorner.Parent = panel
+
+local glassy = Instance.new("UIGradient")
+glassy.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(180, 185, 200)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(240, 243, 250)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(180, 185, 200)),
+})
+glassy.Transparency = NumberSequence.new({
+    NumberSequenceKeypoint.new(0, 0.58),
+    NumberSequenceKeypoint.new(0.5, 0.30),
+    NumberSequenceKeypoint.new(1, 0.58),
+})
+glassy.Rotation = 90
+glassy.Parent = panel
+
+local panelStroke = Instance.new("UIStroke")
+panelStroke.Name = "AnimatedBorder"
+panelStroke.Thickness = 2.5
+panelStroke.Color = ACCENT
+panelStroke.Transparency = 0.20
+panelStroke.LineJoinMode = Enum.LineJoinMode.Round
+panelStroke.Parent = panel
+
+local h, s, v = Color3.toHSV(ACCENT)
+local accentLight = Color3.fromHSV(h, math.max(0, s - 0.3), math.min(1, v + 0.25))
+local accentDark = Color3.fromHSV(h, math.min(1, s + 0.1), math.max(0, v - 0.25))
+
+local strokeGrad = Instance.new("UIGradient")
+strokeGrad.Name = "AnimatedSweep"
+strokeGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, accentDark),
+    ColorSequenceKeypoint.new(0.5, accentLight),
+    ColorSequenceKeypoint.new(1, accentDark),
+})
+strokeGrad.Transparency = NumberSequence.new({
+    NumberSequenceKeypoint.new(0, 0.4),
+    NumberSequenceKeypoint.new(0.5, 0),
+    NumberSequenceKeypoint.new(1, 0.4),
+})
+strokeGrad.Offset = Vector2.new(-1.5, 0)
+strokeGrad.Parent = panelStroke
+
+TweenService:Create(
+    strokeGrad,
+    TweenInfo.new(1.4, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false),
+    {Offset = Vector2.new(1.5, 0)}
+):Play()
+TweenService:Create(
+    panelStroke,
+    TweenInfo.new(1.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+    {Transparency = 0.0}
+):Play()
+
+-- Barra superior: también funciona como zona de arrastre.
+local dragBar = Instance.new("Frame")
+dragBar.Name = "DragBar"
+dragBar.Size = UDim2.new(1, -12, 0, 25)
+dragBar.Position = UDim2.fromOffset(6, 6)
+dragBar.BackgroundColor3 = BG
+dragBar.BackgroundTransparency = 0.08
+dragBar.BorderSizePixel = 0
+dragBar.ZIndex = 3
+dragBar.Parent = panel
+
+local dragCorner = Instance.new("UICorner")
+dragCorner.CornerRadius = UDim.new(0, 9)
+dragCorner.Parent = dragBar
+
+local title = Instance.new("TextLabel")
+title.Name = "Title"
+title.Size = UDim2.new(1, -20, 1, 0)
+title.Position = UDim2.fromOffset(10, 0)
+title.BackgroundTransparency = 1
+title.Text = "WAYPOINT"
+title.TextColor3 = TEXT
+title.Font = Enum.Font.GothamBlack
+title.TextSize = 12
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.ZIndex = 4
+title.Parent = dragBar
+
+local status = Instance.new("TextLabel")
+status.Name = "Status"
+status.Size = UDim2.new(1, -20, 0, 16)
+status.Position = UDim2.fromOffset(10, 34)
+status.BackgroundTransparency = 1
+status.Text = "Sin waypoint guardado"
+status.TextColor3 = DIM_TEXT
+status.Font = Enum.Font.Gotham
+status.TextSize = 9
+status.TextTruncate = Enum.TextTruncate.AtEnd
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.ZIndex = 3
+status.Parent = panel
+
+local function addCorner(parent, radius)
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, radius or 8)
+    corner.Parent = parent
+    return corner
+end
+
+local function createAction(name, text, color, position, width)
+    local holder = Instance.new("Frame")
+    holder.Name = name .. "Holder"
+    holder.Size = UDim2.fromOffset(width, 37)
+    holder.Position = position
+    holder.BackgroundColor3 = color
+    holder.BackgroundTransparency = 0.16
+    holder.BorderSizePixel = 0
+    holder.ZIndex = 3
+    holder.Parent = panel
+    addCorner(holder, 9)
+
+    local holderStroke = Instance.new("UIStroke")
+    holderStroke.Name = "Stroke"
+    holderStroke.Color = ACCENT
+    holderStroke.Thickness = 1.2
+    holderStroke.Transparency = 0.52
+    holderStroke.LineJoinMode = Enum.LineJoinMode.Round
+    holderStroke.Parent = holder
+
+    local button = Instance.new("TextButton")
+    button.Name = name
+    button.Size = UDim2.fromScale(1, 1)
+    button.BackgroundTransparency = 1
+    button.BorderSizePixel = 0
+    button.AutoButtonColor = false
+    button.Text = text
+    button.TextColor3 = TEXT
+    button.Font = Enum.Font.GothamBlack
+    button.TextSize = 10
+    button.TextXAlignment = Enum.TextXAlignment.Center
+    button.ZIndex = 4
+    button.Parent = holder
+
+    button.MouseEnter:Connect(function()
+        TweenService:Create(holder, TweenInfo.new(0.12), {
+            BackgroundTransparency = 0.02,
+        }):Play()
+    end)
+    button.MouseLeave:Connect(function()
+        TweenService:Create(holder, TweenInfo.new(0.16), {
+            BackgroundTransparency = 0.16,
+        }):Play()
+    end)
+
+    return button, holder
+end
+
+local saveButton = createAction(
+    "SaveWaypoint",
+    "SAVE",
+    SAVE_BLUE,
+    UDim2.fromOffset(10, 56),
+    82
+)
+local returnButton = createAction(
+    "ReturnWaypoint",
+    "RETURN",
+    RETURN_RED,
+    UDim2.fromOffset(100, 56),
+    82
+)
+local autoTPButton, autoTPHolder = createAction(
+    "AutoTeleport",
+    "AUTO TP: OFF",
+    AUTOTP_COLOR,
+    UDim2.fromOffset(10, 96),
+    172
+)
+
+local waypointCFrame = nil
+local waypointMarker = nil
+
+local function getCharacterRoot()
+    local character = lp.Character
+    if not character then return nil, nil end
+    local root = character:FindFirstChild("HumanoidRootPart")
+        or character.PrimaryPart
+    return character, root
+end
+
+local function setStatus(text, color)
+    status.Text = tostring(text)
+    status.TextColor3 = color or DIM_TEXT
+end
+
+local function removeMarker()
+    if waypointMarker then
+        pcall(function() waypointMarker:Destroy() end)
+        waypointMarker = nil
+    end
+end
+
+local function createMarker(cframe)
+    removeMarker()
+
+    local marker = Instance.new("Part")
+    marker.Name = MARKER_NAME
+    marker.Shape = Enum.PartType.Ball
+    marker.Size = Vector3.new(1.35, 1.35, 1.35)
+    marker.CFrame = cframe + Vector3.new(0, 1.1, 0)
+    marker.Anchored = true
+    marker.CanCollide = false
+    marker.CanTouch = false
+    marker.CanQuery = false
+    marker.Material = Enum.Material.Neon
+    marker.Color = ACCENT
+    marker.Transparency = 0.18
+    marker.CastShadow = false
+    marker.Parent = workspace
+
+    local light = Instance.new("PointLight")
+    light.Name = "WaypointGlow"
+    light.Color = ACCENT
+    light.Brightness = 1.5
+    light.Range = 8
+    light.Parent = marker
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "WaypointLabel"
+    billboard.Size = UDim2.fromOffset(120, 28)
+    billboard.StudsOffset = Vector3.new(0, 1.3, 0)
+    billboard.AlwaysOnTop = true
+    billboard.MaxDistance = 150
+    billboard.Parent = marker
+
+    local markerText = Instance.new("TextLabel")
+    markerText.Size = UDim2.fromScale(1, 1)
+    markerText.BackgroundTransparency = 1
+    markerText.Text = "WAYPOINT"
+    markerText.TextColor3 = TEXT
+    markerText.TextStrokeTransparency = 0.45
+    markerText.Font = Enum.Font.GothamBlack
+    markerText.TextSize = 10
+    markerText.Parent = billboard
+
+    waypointMarker = marker
+end
+
+saveButton.Activated:Connect(function()
+    local character, root = getCharacterRoot()
+    if not character or not root then
+        setStatus("No se encontró el personaje", Color3.fromRGB(255, 150, 150))
+        return
+    end
+
+    waypointCFrame = root.CFrame
+    createMarker(waypointCFrame)
+    TweenService:Create(panel, TweenInfo.new(0.15), {
+        BackgroundColor3 = ON_COLOR,
+    }):Play()
+    setStatus("Waypoint guardado", Color3.fromRGB(220, 255, 225))
+end)
+
+returnButton.Activated:Connect(function()
+    if not waypointCFrame then
+        setStatus("Primero guarda un waypoint", Color3.fromRGB(255, 210, 135))
+        return
+    end
+
+    local character, root = getCharacterRoot()
+    if not character or not root then
+        setStatus("No se encontró el personaje", Color3.fromRGB(255, 150, 150))
+        return
+    end
+
+    local ok, err = pcall(function()
+        character:PivotTo(waypointCFrame)
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end)
+    if ok then
+        setStatus("Volviste al waypoint", Color3.fromRGB(220, 255, 225))
+    else
+        setStatus("No se pudo volver: " .. tostring(err), Color3.fromRGB(255, 150, 150))
+    end
+end)
+
+-- Auto TP: mientras está activo, teletransporta al waypoint cada 0.5s.
+local autoTPEnabled = false
+
+local function autoTPLoop()
+    while autoTPEnabled do
+        if waypointCFrame then
+            local character, root = getCharacterRoot()
+            if character and root then
+                pcall(function()
+                    character:PivotTo(waypointCFrame)
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+        end
+        task.wait(0.5)
+    end
+end
+
+autoTPButton.Activated:Connect(function()
+    if not autoTPEnabled then
+        if not waypointCFrame then
+            setStatus("Primero guarda un waypoint", Color3.fromRGB(255, 210, 135))
+            return
+        end
+        autoTPEnabled = true
+        autoTPHolder.BackgroundColor3 = ON_COLOR
+        autoTPButton.Text = "AUTO TP: ON"
+        setStatus("Auto TP activado (cada 0.5s)", Color3.fromRGB(220, 255, 225))
+        task.spawn(autoTPLoop)
+    else
+        autoTPEnabled = false
+        autoTPHolder.BackgroundColor3 = AUTOTP_COLOR
+        autoTPButton.Text = "AUTO TP: OFF"
+        setStatus("Auto TP desactivado", DIM_TEXT)
+    end
+end)
+
+-- Arrastre con threshold, igual que HideGuis-7.lua: tocar no mueve; arrastrar sí.
+local dragging = false
+local moved = false
+local dragOrigin = Vector2.zero
+local panelOrigin = UDim2.new()
+local THRESHOLD = 6
+
+dragBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        moved = false
+        dragOrigin = input.Position
+        panelOrigin = panel.Position
+    end
+end)
+
+UIS.InputChanged:Connect(function(input)
+    if not dragging then return end
+    if input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = input.Position - dragOrigin
+        if not moved and (math.abs(delta.X) > THRESHOLD or math.abs(delta.Y) > THRESHOLD) then
+            moved = true
+        end
+        if moved then
+            panel.Position = UDim2.new(
+                panelOrigin.X.Scale, panelOrigin.X.Offset + delta.X,
+                panelOrigin.Y.Scale, panelOrigin.Y.Offset + delta.Y
+            )
+        end
+    end
+end)
+
+UIS.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+        moved = false
+    end
+end)
+
+lp.CharacterRemoving:Connect(function()
+    -- El punto se mantiene guardado durante respawns; solo se elimina el marcador
+    -- si el workspace lo destruye. RETURN informará si el personaje aún no existe.
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- REGISTRO DE FUNCIÓN DE PARADA — requerido por el sistema de scripts externos
+-- Al desactivar: apaga el auto-teleport, borra el marcador del mundo y la GUI.
+-- ════════════════════════════════════════════════════════════════════════
+return function()
+    autoTPEnabled = false
+    removeMarker()
+    pcall(function() gui:Destroy() end)
+end
+
+end
+
 local ModuleFactories = {
     HideGuis = registerHideGuis,
     FOVAdjust = registerFOVAdjust,
+    Waypoint = registerWaypoint,
 }
 
 local activeStops = {}
@@ -609,3 +1042,4 @@ else
         _G["_YY_STOP_ClassicOptions"] = nil
     end
 end
+
