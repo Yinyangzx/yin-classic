@@ -11,4 +11,10 @@ return {
         file = "YinYang_ClassicOptions.lua",
         key = "FOVAdjust",
     },
+    {
+        es = "Waypoint",
+        en = "Waypoint",
+        file = "YinYang_ClassicOptions.lua",
+        key = "Waypoint",
+    },
 }
