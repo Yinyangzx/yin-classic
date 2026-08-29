@@ -17,4 +17,10 @@ return {
         file = "YinYang_ClassicOptions.lua",
         key = "Waypoint",
     },
+    {
+        es = "Optimizar Rendimiento",
+        en = "Performance Optimizer",
+        file = "YinYang_ClassicOptions.lua",
+        key = "PerformanceOptimizer",
+    },
 }
