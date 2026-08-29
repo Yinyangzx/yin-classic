@@ -984,10 +984,1418 @@ end
 
 end
 
+local function registerPerformanceOptimizer()
+--[[
+    ════════════════════════════════════════════════════════════════════════
+    YINYANG EXTERNAL SCRIPT — PerformanceOptimizer
+    ════════════════════════════════════════════════════════════════════════
+    Optimización visual local y reversible (particulas, luces, trails,
+    sombras, texturas, etc). Panel PRO con rail de iconos + escaneo.
+    Sigue la misma convención de scripts externos: al final registra su
+    "return function() ... end" de parada, que reutiliza el propio
+    GEN[API_NAME].Shutdown ya implementado por el script (restaura todos
+    los valores originales, desconecta watchers y destruye su GUI).
+    ════════════════════════════════════════════════════════════════════════
+]]
+
+--[[
+    Yin Yang Performance Optimizer
+    Optimización visual local y reversible para experiencias Roblox grandes.
+
+    Seguridad de alcance:
+    - No modifica Anchored, CanCollide, CFrame, AssemblyLinearVelocity ni remotes.
+    - No destruye instancias.
+    - Procesa Workspace por lotes para no bloquear el frame.
+    - Guarda los valores originales y permite restaurarlos.
+
+    Uso:
+      getgenv().YinYangPerformance.Apply("Ultra")
+      getgenv().YinYangPerformance.Restore()
+      getgenv().YinYangPerformance.Toggle()
+
+    En PC: F6 = aplicar, F7 = restaurar, F8 = alternar.
+    En móvil se aplica automáticamente si AutoApply = true.
+]]
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService") -- añadido: necesario para las animaciones de la GUI nueva (no estaba en el original)
+
+local GEN = (getgenv and getgenv()) or _G
+local API_NAME = "YinYangPerformance"
+
+if GEN[API_NAME] and type(GEN[API_NAME].Shutdown) == "function" then
+    pcall(GEN[API_NAME].Shutdown)
+end
+
+local CONFIG = {
+    AutoApply = false,
+    DefaultProfile = "Ultra",
+    BatchSize = 80,
+    YieldSeconds = 0.01,
+    WatchNewInstances = true,
+
+    Profiles = {
+        Balanced = {
+            DisableParticles = true,
+            DisableTrailsBeams = true,
+            DisableLights = true,
+            DisablePostEffects = true,
+            DisableHighlights = true,
+            HideAccessories = false,
+            HideClothing = false,
+            HideWorldTextures = false,
+            DisableShadows = false,
+            SimplifyBodyColors = false,
+            DisableTerrainDecoration = false,
+        },
+        Performance = {
+            DisableParticles = true,
+            DisableTrailsBeams = true,
+            DisableLights = true,
+            DisablePostEffects = true,
+            DisableHighlights = true,
+            HideAccessories = true,
+            HideClothing = true,
+            HideWorldTextures = false,
+            DisableShadows = true,
+            SimplifyBodyColors = true,
+            DisableTerrainDecoration = true,
+        },
+        Ultra = {
+            DisableParticles = true,
+            DisableTrailsBeams = true,
+            DisableLights = true,
+            DisablePostEffects = true,
+            DisableHighlights = true,
+            HideAccessories = true,
+            HideClothing = true,
+            HideWorldTextures = true,
+            DisableShadows = true,
+            SimplifyBodyColors = true,
+            DisableTerrainDecoration = true,
+        },
+    },
+}
+
+local state = {
+    Enabled = false,
+    ProfileName = nil,
+    Profile = nil,
+    Records = {},
+    Queue = {},
+    QueueHead = 1,
+    QueueTail = 0,
+    QueueCount = 0,
+    QueueSet = {},
+    Processing = false,
+    Token = 0,
+    Connections = {},
+    Stats = {
+        Processed = 0,
+        Changed = 0,
+        Restored = 0,
+    },
+    -- Contadores por categoría, solo para alimentar el resumen del LOG (no afecta la lógica de optimización)
+    CategoryChanged = {
+        Particles = 0, TrailsBeams = 0, Lights = 0, PostEffects = 0, Highlights = 0,
+        Textures = 0, Clothing = 0, Accessories = 0, Shadows = 0, Terrain = 0,
+    },
+}
+
+local function safeGet(instance, property)
+    local ok, value = pcall(function()
+        return instance[property]
+    end)
+    if ok then
+        return true, value
+    end
+    return false, nil
+end
+
+local function safeSet(instance, property, value)
+    return pcall(function()
+        instance[property] = value
+    end)
+end
+
+local function remember(instance, property)
+    local record = state.Records[instance]
+    if not record then
+        record = {}
+        state.Records[instance] = record
+    end
+
+    if record[property] == nil then
+        local ok, value = safeGet(instance, property)
+        if ok then
+            record[property] = value
+        end
+    end
+
+    return record[property]
+end
+
+local function setIfDifferent(instance, property, value)
+    local currentOk, current = safeGet(instance, property)
+    if not currentOk or current == value then
+        return false
+    end
+
+    remember(instance, property)
+    if safeSet(instance, property, value) then
+        state.Stats.Changed = state.Stats.Changed + 1
+        return true
+    end
+
+    return false
+end
+
+local function bumpCategory(category)
+    state.CategoryChanged[category] = (state.CategoryChanged[category] or 0) + 1
+end
+
+local function hasAncestorOfClass(instance, className)
+    local ok, result = pcall(function()
+        return instance:FindFirstAncestorWhichIsA(className) ~= nil
+    end)
+    return ok and result
+end
+
+local function isCharacterAccessoryPart(instance)
+    local ok, result = pcall(function()
+        local accessory = instance:FindFirstAncestorWhichIsA("Accessory")
+        local model = accessory and accessory:FindFirstAncestorWhichIsA("Model")
+        return accessory ~= nil and model ~= nil and model:FindFirstChildOfClass("Humanoid") ~= nil
+    end)
+    return ok and result
+end
+
+local function isHumanoidCharacter(instance)
+    return hasAncestorOfClass(instance, "Humanoid")
+end
+
+local function processPostEffect(instance, profile)
+    if not profile.DisablePostEffects then
+        return
+    end
+
+    if instance:IsA("PostEffect") then
+        if setIfDifferent(instance, "Enabled", false) then bumpCategory("PostEffects") end
+    elseif instance:IsA("Atmosphere") then
+        local a = setIfDifferent(instance, "Density", 0)
+        local b = setIfDifferent(instance, "Haze", 0)
+        local c = setIfDifferent(instance, "Glare", 0)
+        if a or b or c then bumpCategory("PostEffects") end
+    end
+end
+
+local function processVisualInstance(instance, profile)
+    if not instance or not instance.Parent then
+        return
+    end
+
+    state.Stats.Processed = state.Stats.Processed + 1
+    processPostEffect(instance, profile)
+
+    if profile.DisableParticles then
+        if instance:IsA("ParticleEmitter") or instance:IsA("Smoke") or instance:IsA("Fire") or instance:IsA("Sparkles") then
+            if setIfDifferent(instance, "Enabled", false) then bumpCategory("Particles") end
+        end
+    end
+
+    if profile.DisableTrailsBeams then
+        if instance:IsA("Trail") or instance:IsA("Beam") then
+            if setIfDifferent(instance, "Enabled", false) then bumpCategory("TrailsBeams") end
+        end
+    end
+
+    if profile.DisableLights and (instance:IsA("PointLight") or instance:IsA("SpotLight") or instance:IsA("SurfaceLight")) then
+        if setIfDifferent(instance, "Enabled", false) then bumpCategory("Lights") end
+    end
+
+    if profile.DisableHighlights and instance:IsA("Highlight") then
+        if setIfDifferent(instance, "Enabled", false) then bumpCategory("Highlights") end
+    end
+
+    if profile.HideWorldTextures and (instance:IsA("Decal") or instance:IsA("Texture")) then
+        if setIfDifferent(instance, "Transparency", 1) then bumpCategory("Textures") end
+    end
+
+    if profile.HideClothing and (instance:IsA("Shirt") or instance:IsA("Pants") or instance:IsA("ShirtGraphic")) then
+        local changed = false
+        if instance:IsA("Shirt") then
+            changed = setIfDifferent(instance, "ShirtTemplate", "")
+        elseif instance:IsA("Pants") then
+            changed = setIfDifferent(instance, "PantsTemplate", "")
+        elseif instance:IsA("ShirtGraphic") then
+            changed = setIfDifferent(instance, "Graphic", "")
+        end
+        if changed then bumpCategory("Clothing") end
+    end
+
+    if profile.SimplifyBodyColors and instance:IsA("BodyColors") then
+        local neutral = BrickColor.new("Medium stone grey")
+        setIfDifferent(instance, "HeadColor", neutral)
+        setIfDifferent(instance, "LeftArmColor", neutral)
+        setIfDifferent(instance, "RightArmColor", neutral)
+        setIfDifferent(instance, "LeftLegColor", neutral)
+        setIfDifferent(instance, "RightLegColor", neutral)
+        setIfDifferent(instance, "TorsoColor", neutral)
+    end
+
+    if instance:IsA("BasePart") then
+        if profile.DisableShadows then
+            if setIfDifferent(instance, "CastShadow", false) then bumpCategory("Shadows") end
+        end
+
+        if profile.HideAccessories and isCharacterAccessoryPart(instance) then
+            if setIfDifferent(instance, "LocalTransparencyModifier", 1) then bumpCategory("Accessories") end
+        end
+    end
+end
+
+local function processTerrain(profile)
+    if not profile.DisableTerrainDecoration then
+        return
+    end
+
+    local terrain = Workspace:FindFirstChildOfClass("Terrain")
+    if terrain then
+        if setIfDifferent(terrain, "Decoration", false) then bumpCategory("Terrain") end
+    end
+end
+
+local function enqueue(instance)
+    if not instance or state.QueueSet[instance] then
+        return
+    end
+    state.QueueSet[instance] = true
+    state.QueueTail = state.QueueTail + 1
+    state.Queue[state.QueueTail] = instance
+    state.QueueCount = state.QueueCount + 1
+end
+
+local function disconnectConnections()
+    for _, connection in ipairs(state.Connections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    state.Connections = {}
+end
+
+local function processQueue(token)
+    if state.Processing then
+        return
+    end
+
+    state.Processing = true
+    task.spawn(function()
+        while state.Enabled and token == state.Token and state.QueueCount > 0 do
+            local batch = math.max(1, tonumber(CONFIG.BatchSize) or 80)
+            local processedInBatch = 0
+
+            while state.Enabled and token == state.Token and processedInBatch < batch and state.QueueCount > 0 do
+                local instance = state.Queue[state.QueueHead]
+                state.Queue[state.QueueHead] = nil
+                state.QueueHead = state.QueueHead + 1
+                state.QueueCount = state.QueueCount - 1
+                state.QueueSet[instance] = nil
+                processVisualInstance(instance, state.Profile)
+                processedInBatch = processedInBatch + 1
+            end
+
+            if state.Enabled and token == state.Token and state.QueueCount > 0 then
+                task.wait(CONFIG.YieldSeconds)
+            end
+        end
+
+        state.Processing = false
+    end)
+end
+
+local function enqueueWorkspaceSnapshot()
+    local descendants = Workspace:GetDescendants()
+    for index, instance in ipairs(descendants) do
+        enqueue(instance)
+        if index % math.max(1, CONFIG.BatchSize) == 0 then
+            task.wait(CONFIG.YieldSeconds)
+        end
+    end
+end
+
+local function installWatchers(token)
+    if not CONFIG.WatchNewInstances then
+        return
+    end
+
+    state.Connections[#state.Connections + 1] = Workspace.DescendantAdded:Connect(function(instance)
+        if state.Enabled and token == state.Token then
+            enqueue(instance)
+            processQueue(token)
+        end
+    end)
+
+    state.Connections[#state.Connections + 1] = Lighting.DescendantAdded:Connect(function(instance)
+        if state.Enabled and token == state.Token then
+            enqueue(instance)
+            processQueue(token)
+        end
+    end)
+end
+
+local function restoreAll()
+    state.Token = state.Token + 1
+    state.Enabled = false
+    disconnectConnections()
+    state.Queue = {}
+    state.QueueHead = 1
+    state.QueueTail = 0
+    state.QueueCount = 0
+    state.QueueSet = {}
+    state.Processing = false
+
+    for instance, record in pairs(state.Records) do
+        for property, originalValue in pairs(record) do
+            if instance and instance.Parent then
+                if safeSet(instance, property, originalValue) then
+                    state.Stats.Restored = state.Stats.Restored + 1
+                end
+            end
+        end
+    end
+
+    state.Records = {}
+    state.Profile = nil
+    state.ProfileName = nil
+    for category in pairs(state.CategoryChanged) do
+        state.CategoryChanged[category] = 0
+    end
+end
+
+local function applyProfile(profileName)
+    local profile = CONFIG.Profiles[profileName] or CONFIG.Profiles[CONFIG.DefaultProfile]
+    if not profile then
+        warn("YinYang Performance: perfil inexistente")
+        return false
+    end
+
+    restoreAll()
+    state.Token = state.Token + 1
+    local token = state.Token
+    state.Enabled = true
+    state.ProfileName = profileName or CONFIG.DefaultProfile
+    state.Profile = profile
+    state.Stats.Processed = 0
+    state.Stats.Changed = 0
+    state.Stats.Restored = 0
+
+    processTerrain(profile)
+    installWatchers(token)
+
+    task.spawn(function()
+        enqueueWorkspaceSnapshot()
+        processQueue(token)
+    end)
+
+    print("YinYang Performance: perfil " .. tostring(state.ProfileName) .. " aplicado por lotes")
+    return true
+end
+
+local function toggle()
+    if state.Enabled then
+        restoreAll()
+        print("YinYang Performance: restaurado")
+        return false
+    end
+
+    return applyProfile(state.ProfileName or CONFIG.DefaultProfile)
+end
+
+local function getStats()
+    return {
+        Enabled = state.Enabled,
+        Profile = state.ProfileName,
+        Processed = state.Stats.Processed,
+        Changed = state.Stats.Changed,
+        Restored = state.Stats.Restored,
+        Pending = state.QueueCount,
+    }
+end
+
+local CATEGORY_ORDER = {
+    "Particles",
+    "TrailsBeams",
+    "Lights",
+    "PostEffects",
+    "Highlights",
+    "Textures",
+    "Clothing",
+    "Accessories",
+    "Shadows",
+    "Terrain",
+}
+
+local CATEGORY_LABELS = {
+    Particles = "Partículas / humo / fuego",
+    TrailsBeams = "Trails y beams",
+    Lights = "Luces dinámicas",
+    PostEffects = "Postprocesado y atmósfera",
+    Highlights = "Highlights",
+    Textures = "Decals y texturas",
+    Clothing = "Ropa y camisetas",
+    Accessories = "Accesorios de personajes",
+    Shadows = "Sombras",
+    Terrain = "Decoración del terreno",
+}
+
+local diagnostic = {
+    Running = false,
+    Token = 0,
+    Counts = {},
+    Samples = {},
+    Total = 0,
+    Selected = {},
+}
+
+for _, category in ipairs(CATEGORY_ORDER) do
+    diagnostic.Counts[category] = 0
+    diagnostic.Samples[category] = {}
+    diagnostic.Selected[category] = true
+end
+
+local ui = {
+    ScreenGui = nil,
+    Panel = nil,
+    Rows = {},
+    Status = nil,
+    ScanButton = nil,
+    ApplyButton = nil,
+    RestoreButton = nil,
+    Scale = nil,
+}
+
+local function classify(instance)
+    if instance:IsA("ParticleEmitter") or instance:IsA("Smoke") or instance:IsA("Fire") or instance:IsA("Sparkles") then
+        return "Particles"
+    elseif instance:IsA("Trail") or instance:IsA("Beam") then
+        return "TrailsBeams"
+    elseif instance:IsA("PointLight") or instance:IsA("SpotLight") or instance:IsA("SurfaceLight") then
+        return "Lights"
+    elseif instance:IsA("PostEffect") or instance:IsA("Atmosphere") then
+        return "PostEffects"
+    elseif instance:IsA("Highlight") then
+        return "Highlights"
+    elseif instance:IsA("Decal") or instance:IsA("Texture") then
+        return "Textures"
+    elseif instance:IsA("Shirt") or instance:IsA("Pants") or instance:IsA("ShirtGraphic") then
+        return "Clothing"
+    elseif instance:IsA("BasePart") and isCharacterAccessoryPart(instance) then
+        return "Accessories"
+    elseif instance:IsA("BasePart") then
+        local ok, casts = safeGet(instance, "CastShadow")
+        if ok and casts then
+            return "Shadows"
+        end
+    end
+    return nil
+end
+
+local function formatNumber(value)
+    if value >= 1000000 then
+        return string.format("%.1fM", value / 1000000)
+    elseif value >= 1000 then
+        return string.format("%.1fk", value / 1000)
+    end
+    return tostring(value)
+end
+
+local function refreshRows()
+    for _, category in ipairs(CATEGORY_ORDER) do
+        local row = ui.Rows[category]
+        if row then
+            local mark = diagnostic.Selected[category] and "☑" or "☐"
+            row.Text = mark .. "  " .. CATEGORY_LABELS[category] .. "  [" .. formatNumber(diagnostic.Counts[category] or 0) .. "]"
+            row.TextColor3 = diagnostic.Selected[category] and Color3.fromRGB(235, 245, 255) or Color3.fromRGB(125, 135, 150)
+        end
+    end
+end
+
+local function updateStatus(message)
+    if ui.Status then
+        ui.Status.Text = message
+    end
+end
+
+local function buildSelectionProfile()
+    return {
+        DisableParticles = diagnostic.Selected.Particles,
+        DisableTrailsBeams = diagnostic.Selected.TrailsBeams,
+        DisableLights = diagnostic.Selected.Lights,
+        DisablePostEffects = diagnostic.Selected.PostEffects,
+        DisableHighlights = diagnostic.Selected.Highlights,
+        HideWorldTextures = diagnostic.Selected.Textures,
+        HideClothing = diagnostic.Selected.Clothing,
+        HideAccessories = diagnostic.Selected.Accessories,
+        DisableShadows = diagnostic.Selected.Shadows,
+        SimplifyBodyColors = false,
+        DisableTerrainDecoration = diagnostic.Selected.Terrain,
+    }
+end
+
+local function scanEnvironment()
+    if diagnostic.Running then
+        return
+    end
+
+    diagnostic.Token = diagnostic.Token + 1
+    local token = diagnostic.Token
+    diagnostic.Running = true
+    diagnostic.Total = 0
+    for _, category in ipairs(CATEGORY_ORDER) do
+        diagnostic.Counts[category] = 0
+        diagnostic.Samples[category] = {}
+    end
+    updateStatus("Escaneando Workspace y Lighting...")
+    refreshRows()
+
+    task.spawn(function()
+        local all = {}
+        local seen = {}
+        for _, instance in ipairs(Workspace:GetDescendants()) do
+            if not seen[instance] then
+                seen[instance] = true
+                all[#all + 1] = instance
+            end
+        end
+        for _, instance in ipairs(Lighting:GetDescendants()) do
+            if not seen[instance] then
+                seen[instance] = true
+                all[#all + 1] = instance
+            end
+        end
+
+        local batch = math.max(1, tonumber(CONFIG.BatchSize) or 80)
+        for index, instance in ipairs(all) do
+            if token ~= diagnostic.Token then
+                return
+            end
+            local category = classify(instance)
+            if category then
+                diagnostic.Counts[category] = diagnostic.Counts[category] + 1
+                diagnostic.Total = diagnostic.Total + 1
+                if #diagnostic.Samples[category] < 3 then
+                    diagnostic.Samples[category][#diagnostic.Samples[category] + 1] = instance:GetFullName()
+                end
+            end
+            if index % batch == 0 then
+                updateStatus("Escaneando... " .. formatNumber(index) .. " instancias revisadas")
+                refreshRows()
+                task.wait(CONFIG.YieldSeconds)
+            end
+        end
+
+        diagnostic.Running = false
+        updateStatus("Escaneo terminado: " .. formatNumber(diagnostic.Total) .. " elementos visuales detectados")
+        refreshRows()
+    end)
+end
+
+local function applySelectedCategories()
+    if diagnostic.Running then
+        updateStatus("Espera a que termine el escaneo")
+        return
+    end
+
+    local profile = buildSelectionProfile()
+    restoreAll()
+    state.Token = state.Token + 1
+    local token = state.Token
+    state.Enabled = true
+    state.ProfileName = "Diagnostic"
+    state.Profile = profile
+    state.Stats.Processed = 0
+    state.Stats.Changed = 0
+    state.Stats.Restored = 0
+
+    processTerrain(profile)
+    installWatchers(token)
+    task.spawn(function()
+        enqueueWorkspaceSnapshot()
+        processQueue(token)
+    end)
+    updateStatus("Aplicando categorías seleccionadas por lotes...")
+end
+
+-- ════════════════════════════════════════════════════════════════════
+--  GUI PRO v3 — rediseño con rail de íconos lateral + tamaño responsive
+--  real (misma técnica que yin_FIXED: clamp contra ScreenGui.AbsoluteSize,
+--  sin UIScale). Nada de esto toca la lógica de optimización de arriba.
+-- ════════════════════════════════════════════════════════════════════
+
+-- ── Paleta (tokens del tema "Dark" de yin_FIXED) ──────────────────
+local BG_DEEP      = Color3.fromRGB(12, 12, 14)      -- ≈ Theme.Background
+local BG_SURFACE   = Color3.fromRGB(40, 40, 45)      -- = Theme.Secondary (tarjetas)
+local BG_SURFACE2  = Color3.fromRGB(58, 58, 64)      -- = Theme.AccentOff (hover / track off)
+local STROKE_COLOR = Color3.fromRGB(90, 90, 96)      -- = Theme.Stroke
+local YIN_COLOR    = Color3.fromRGB(240, 240, 240)
+local YANG_COLOR   = Color3.fromRGB(135, 145, 255)   -- identidad única del script
+local YANG_COLOR_B = Color3.fromRGB(80, 205, 255)
+local ON_COLOR     = Color3.fromRGB(52, 199, 89)     -- = Theme.ToggleOn
+local OFF_COLOR    = BG_SURFACE2
+local TEXT_MAIN    = Color3.fromRGB(240, 240, 240)   -- = Theme.Text
+local TEXT_SUB     = Color3.fromRGB(190, 192, 198)
+local TEXT_DIM     = Color3.fromRGB(160, 160, 165)   -- = Theme.TextDim
+
+-- ── Helpers visuales ───────────────────────────────────────────────
+local function corner(inst, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = radius or UDim.new(0, 8)
+    c.Parent = inst
+    return c
+end
+
+local function stroke(inst, color, thickness, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = color
+    s.Thickness = thickness or 1
+    s.Transparency = transparency or 0.35
+    s.LineJoinMode = Enum.LineJoinMode.Round
+    s.Parent = inst
+    return s
+end
+
+-- Gradiente "glassy" + sweep animado (misma técnica que HideGuis-7.lua: Tween sobre
+-- UIGradient/UIStroke, sin loops, así que no genera lag).
+local function applyGlassSweep(target, accentA, accentB)
+    local glassy = Instance.new("UIGradient")
+    glassy.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0,   Color3.fromRGB(60, 64, 78)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(90, 96, 116)),
+        ColorSequenceKeypoint.new(1,   Color3.fromRGB(60, 64, 78)),
+    })
+    glassy.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0,   0.55),
+        NumberSequenceKeypoint.new(0.5, 0.25),
+        NumberSequenceKeypoint.new(1,   0.55),
+    })
+    glassy.Rotation = 90
+    glassy.Parent = target
+
+    local ring = stroke(target, accentA, 1.6, 0.25)
+    local sweep = Instance.new("UIGradient")
+    sweep.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0,   accentB),
+        ColorSequenceKeypoint.new(0.5, accentA),
+        ColorSequenceKeypoint.new(1,   accentB),
+    })
+    sweep.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0,   0.5),
+        NumberSequenceKeypoint.new(0.5, 0.05),
+        NumberSequenceKeypoint.new(1,   0.5),
+    })
+    sweep.Offset = Vector2.new(-1.5, 0)
+    sweep.Parent = ring
+
+    TweenService:Create(
+        sweep,
+        TweenInfo.new(1.6, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false),
+        { Offset = Vector2.new(1.5, 0) }
+    ):Play()
+    TweenService:Create(
+        ring,
+        TweenInfo.new(1.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+        { Transparency = 0.05 }
+    ):Play()
+
+    return ring
+end
+
+local function makeLabel(parent, text, size, position, textSize, color, font, align)
+    local lbl = Instance.new("TextLabel")
+    lbl.BackgroundTransparency = 1
+    lbl.Size = size
+    lbl.Position = position
+    lbl.Text = text
+    lbl.TextColor3 = color or TEXT_MAIN
+    lbl.Font = font or Enum.Font.Gotham
+    lbl.TextSize = textSize or 12
+    lbl.TextXAlignment = align or Enum.TextXAlignment.Left
+    lbl.TextWrapped = true
+    lbl.Parent = parent
+    return lbl
+end
+
+local function makeTextButton(parent, text, size, position, color)
+    local button = Instance.new("TextButton")
+    button.BackgroundColor3 = color
+    button.BorderSizePixel = 0
+    button.Size = size
+    button.Position = position
+    button.Font = Enum.Font.GothamBold
+    button.Text = text
+    button.TextColor3 = Color3.fromRGB(240, 240, 240)
+    button.TextSize = 13
+    button.AutoButtonColor = true
+    button.Parent = parent
+    corner(button, UDim.new(0, 10))
+    return button
+end
+
+-- Chip/badge redondeado (estilo "361 flags" de la referencia Vaystrap)
+local function makeChip(parent, text, position, size)
+    local chip = Instance.new("Frame")
+    chip.BackgroundColor3 = BG_SURFACE2
+    chip.BorderSizePixel = 0
+    chip.Size = size or UDim2.fromOffset(78, 20)
+    chip.Position = position
+    chip.Parent = parent
+    corner(chip, UDim.new(1, 0))
+    local lbl = makeLabel(chip, text, UDim2.new(1, -12, 1, 0), UDim2.fromOffset(6, 0), 10, TEXT_SUB, Enum.Font.GothamMedium, Enum.TextXAlignment.Center)
+    return chip, lbl
+end
+
+-- Switch estilo iOS con sombra de profundidad (inspirado en el CreateToggle de yin_FIXED)
+local function makeSwitch(parent, position, initial, onChanged)
+    local track = Instance.new("Frame")
+    track.Size = UDim2.fromOffset(44, 24)
+    track.Position = position
+    track.BackgroundColor3 = initial and ON_COLOR or OFF_COLOR
+    track.BorderSizePixel = 0
+    track.Parent = parent
+    corner(track, UDim.new(1, 0))
+
+    local knobShadow = Instance.new("Frame")
+    knobShadow.Size = UDim2.fromOffset(20, 20)
+    knobShadow.AnchorPoint = Vector2.new(0, 0.5)
+    knobShadow.Position = UDim2.new(0, 3, 0.5, 1)
+    knobShadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    knobShadow.BackgroundTransparency = 0.7
+    knobShadow.BorderSizePixel = 0
+    knobShadow.ZIndex = 2
+    knobShadow.Parent = track
+    corner(knobShadow, UDim.new(1, 0))
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.fromOffset(20, 20)
+    knob.AnchorPoint = Vector2.new(0, 0.5)
+    knob.Position = UDim2.new(0, 2, 0.5, 0)
+    knob.BackgroundColor3 = Color3.fromRGB(250, 250, 253)
+    knob.BorderSizePixel = 0
+    knob.ZIndex = 3
+    knob.Parent = track
+    corner(knob, UDim.new(1, 0))
+
+    local btn = Instance.new("TextButton")
+    btn.BackgroundTransparency = 1
+    btn.Size = UDim2.new(1, 0, 1, 0)
+    btn.Text = ""
+    btn.ZIndex = 4
+    btn.Parent = track
+
+    local ON_X, OFF_X = 22, 2
+
+    local isOn = initial
+    local function set(value, silent)
+        isOn = value
+        TweenService:Create(track, TweenInfo.new(0.15), { BackgroundColor3 = value and ON_COLOR or OFF_COLOR }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {
+            Position = UDim2.new(0, value and ON_X or OFF_X, 0.5, 0)
+        }):Play()
+        TweenService:Create(knobShadow, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {
+            Position = UDim2.new(0, (value and ON_X or OFF_X) + 1, 0.5, 1)
+        }):Play()
+        if not silent and onChanged then
+            onChanged(value)
+        end
+    end
+
+    btn.MouseButton1Click:Connect(function()
+        set(not isOn)
+    end)
+
+    return { Frame = track, Set = set, Get = function() return isOn end }
+end
+
+local uiLoopToken = 0
+
+local function makePanel()
+    local localPlayer = Players.LocalPlayer
+    local playerGui = localPlayer and (localPlayer:FindFirstChildOfClass("PlayerGui") or localPlayer:WaitForChild("PlayerGui", 5))
+    if not playerGui then
+        return
+    end
+
+    local old = playerGui:FindFirstChild("YinYangPerformanceDiagnostic")
+    if old then
+        old:Destroy()
+    end
+
+    uiLoopToken = uiLoopToken + 1
+    local myToken = uiLoopToken
+
+    local screen = Instance.new("ScreenGui")
+    screen.Name = "YinYangPerformanceDiagnostic"
+    screen.ResetOnSpawn = false
+    screen.IgnoreGuiInset = true
+    screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screen.DisplayOrder = 9999
+    screen.Parent = playerGui
+    ui.ScreenGui = screen
+
+    -- ── Panel principal — tamaño responsive real ──────────────────
+    -- Misma técnica que Window.UpdateWindowSize de yin_FIXED: preset fijo,
+    -- recortado contra el tamaño real de pantalla (92%), sin UIScale.
+    local PRESET_W, PRESET_H = 380, 580
+
+    local panel = Instance.new("Frame")
+    panel.Name = "OptimizerPanel"
+    panel.AnchorPoint = Vector2.new(0.5, 0.5)
+    panel.Position = UDim2.fromScale(0.5, 0.5)
+    panel.Size = UDim2.fromOffset(PRESET_W, PRESET_H)
+    panel.BackgroundColor3 = BG_DEEP
+    panel.BorderSizePixel = 0
+    panel.ClipsDescendants = true
+    panel.Visible = false
+    panel.Parent = screen
+    ui.Panel = panel
+    corner(panel, UDim.new(0, 16))
+    applyGlassSweep(panel, YANG_COLOR, YANG_COLOR_B)
+
+    local function updateWindowSize()
+        local avail = screen.AbsoluteSize
+        local width, height = PRESET_W, PRESET_H
+        if avail.X > 0 and avail.Y > 0 then
+            width = math.min(PRESET_W, math.floor(avail.X * 0.92))
+            height = math.min(PRESET_H, math.floor(avail.Y * 0.92))
+        end
+        panel.Size = UDim2.fromOffset(width, height)
+    end
+    updateWindowSize()
+    screen:GetPropertyChangedSignal("AbsoluteSize"):Connect(updateWindowSize)
+
+    local header = Instance.new("Frame")
+    header.Size = UDim2.new(1, 0, 0, 52)
+    header.BackgroundTransparency = 1
+    header.Parent = panel
+
+    local title = makeLabel(header, "YIN YANG", UDim2.new(1, -100, 0, 20), UDim2.fromOffset(18, 8), 15, Color3.fromRGB(0, 0, 0), Enum.Font.GothamBlack)
+    -- Animación "Yin Yang" de la librería: el título alterna negro↔blanco lentamente.
+    -- La librería lo hace con RunService.RenderStepped (cálculo de seno por frame);
+    -- acá uso un Tween infinito con reverses=true — mismo resultado visual, sin loop por frame.
+    TweenService:Create(
+        title,
+        TweenInfo.new(2.4, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+        { TextColor3 = Color3.fromRGB(255, 255, 255) }
+    ):Play()
+
+    makeLabel(header, "PERFORMANCE OPTIMIZER", UDim2.new(1, -100, 0, 16), UDim2.fromOffset(18, 27), 10, TEXT_DIM, Enum.Font.GothamMedium)
+
+    local close = makeTextButton(header, "×", UDim2.fromOffset(34, 30), UDim2.new(1, -44, 0, 11), BG_SURFACE)
+    close.TextSize = 20
+    close.MouseButton1Click:Connect(function()
+        panel.Visible = false
+    end)
+
+    -- ── Cuerpo: rail de íconos (izquierda) + contenido (derecha) ──
+    local RAIL_W = 58
+    local FOOTER_H = 96
+
+    local body = Instance.new("Frame")
+    body.Size = UDim2.new(1, -16, 1, -52 - FOOTER_H)
+    body.Position = UDim2.fromOffset(8, 52)
+    body.BackgroundTransparency = 1
+    body.Parent = panel
+
+    local rail = Instance.new("Frame")
+    rail.Size = UDim2.new(0, RAIL_W, 1, 0)
+    rail.BackgroundColor3 = BG_DEEP
+    rail.BackgroundTransparency = 0.1
+    rail.BorderSizePixel = 0
+    rail.Parent = body
+    corner(rail, UDim.new(0, 12))
+    stroke(rail, STROKE_COLOR, 1, 0.55)
+
+    local railList = Instance.new("UIListLayout")
+    railList.Padding = UDim.new(0, 8)
+    railList.SortOrder = Enum.SortOrder.LayoutOrder
+    railList.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    railList.Parent = rail
+    local railPad = Instance.new("UIPadding")
+    railPad.PaddingTop = UDim.new(0, 10)
+    railPad.Parent = rail
+
+    local function makeRailIcon(glyph, order)
+        local cell = Instance.new("Frame")
+        cell.Size = UDim2.fromOffset(40, 40)
+        cell.BackgroundTransparency = 1
+        cell.LayoutOrder = order
+        cell.Parent = rail
+
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, 0, 1, 0)
+        btn.BackgroundColor3 = BG_SURFACE
+        btn.BorderSizePixel = 0
+        btn.Text = glyph
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 12
+        btn.TextColor3 = TEXT_DIM
+        btn.AutoButtonColor = false
+        btn.Parent = cell
+        corner(btn, UDim.new(0, 11))
+
+        local indicator = Instance.new("Frame")
+        indicator.Size = UDim2.fromOffset(3, 20)
+        indicator.AnchorPoint = Vector2.new(0, 0.5)
+        indicator.Position = UDim2.new(0, -7, 0.5, 0)
+        indicator.BackgroundColor3 = YANG_COLOR
+        indicator.BorderSizePixel = 0
+        indicator.Visible = false
+        indicator.Parent = cell
+        corner(indicator, UDim.new(1, 0))
+
+        return btn, indicator
+    end
+
+    local content = Instance.new("Frame")
+    content.Size = UDim2.new(1, -RAIL_W - 8, 1, 0)
+    content.Position = UDim2.fromOffset(RAIL_W + 8, 0)
+    content.BackgroundTransparency = 1
+    content.Parent = body
+
+    -- Fondo decorativo del tema Dark de yin_FIXED (mismo asset que usa la librería,
+    -- vive detrás de las tarjetas — solo se asoma por los huecos entre ellas).
+    -- Transparencia más alta que en la librería (0.1) porque acá hay texto denso
+    -- (log de eventos) encima y necesita quedar legible.
+    local backgroundArt = Instance.new("ImageLabel")
+    backgroundArt.Name = "BackgroundArt"
+    backgroundArt.AnchorPoint = Vector2.new(0.5, 0.5)
+    backgroundArt.Position = UDim2.fromScale(0.5, 0.5)
+    backgroundArt.Size = UDim2.new(1, 20, 1, 20)
+    backgroundArt.BackgroundTransparency = 1
+    backgroundArt.Image = "rbxassetid://138004303203419"
+    backgroundArt.ImageTransparency = 0.82
+    backgroundArt.ScaleType = Enum.ScaleType.Crop
+    backgroundArt.ZIndex = 1
+    backgroundArt.Parent = content
+    corner(backgroundArt, UDim.new(0, 10))
+
+    -- ── PESTAÑA LOG ────────────────────────────────────────────
+    local logTab = Instance.new("Frame")
+    logTab.Size = UDim2.new(1, 0, 1, 0)
+    logTab.BackgroundTransparency = 1
+    logTab.Visible = true
+    logTab.Parent = content
+
+    local statsBar = Instance.new("Frame")
+    statsBar.Size = UDim2.new(1, 0, 0, 34)
+    statsBar.BackgroundColor3 = BG_SURFACE
+    statsBar.BorderSizePixel = 0
+    statsBar.Parent = logTab
+    corner(statsBar, UDim.new(0, 10))
+    local statsLabel = makeLabel(statsBar, "Procesados 0 · Cambiados 0 · Restaurados 0 · Pendientes 0",
+        UDim2.new(1, -16, 1, 0), UDim2.fromOffset(8, 0), 10, TEXT_SUB, Enum.Font.GothamMedium, Enum.TextXAlignment.Center)
+    ui.StatsLabel = statsLabel
+
+    makeLabel(logTab, "RESUMEN POR CATEGORÍA", UDim2.new(1, 0, 0, 16), UDim2.fromOffset(2, 42), 10, TEXT_DIM, Enum.Font.GothamBold)
+
+    local summaryList = Instance.new("ScrollingFrame")
+    summaryList.Position = UDim2.fromOffset(0, 60)
+    summaryList.Size = UDim2.new(1, 0, 0, 130)
+    summaryList.BackgroundColor3 = BG_SURFACE
+    summaryList.BorderSizePixel = 0
+    summaryList.ScrollBarThickness = 4
+    summaryList.CanvasSize = UDim2.new()
+    summaryList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    summaryList.Parent = logTab
+    corner(summaryList, UDim.new(0, 10))
+    local summaryLayout = Instance.new("UIListLayout")
+    summaryLayout.Padding = UDim.new(0, 4)
+    summaryLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    summaryLayout.Parent = summaryList
+    local summaryPad = Instance.new("UIPadding")
+    summaryPad.PaddingTop = UDim.new(0, 8)
+    summaryPad.PaddingBottom = UDim.new(0, 8)
+    summaryPad.PaddingLeft = UDim.new(0, 10)
+    summaryPad.PaddingRight = UDim.new(0, 10)
+    summaryPad.Parent = summaryList
+
+    ui.SummaryRows = {}
+    for index, category in ipairs(CATEGORY_ORDER) do
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, 0, 0, 22)
+        row.BackgroundTransparency = 1
+        row.LayoutOrder = index
+        row.Parent = summaryList
+        makeLabel(row, CATEGORY_LABELS[category], UDim2.new(1, -100, 1, 0), UDim2.fromOffset(0, 0), 11, TEXT_SUB)
+        local chip, chipLbl = makeChip(row, "0 · 0", UDim2.new(1, -92, 0.5, -10), UDim2.fromOffset(92, 20))
+        ui.SummaryRows[category] = chipLbl
+    end
+
+    makeLabel(logTab, "EVENTOS", UDim2.new(1, 0, 0, 16), UDim2.fromOffset(2, 198), 10, TEXT_DIM, Enum.Font.GothamBold)
+
+    local eventLog = Instance.new("ScrollingFrame")
+    eventLog.Position = UDim2.fromOffset(0, 216)
+    eventLog.Size = UDim2.new(1, 0, 1, -216)
+    eventLog.BackgroundColor3 = BG_SURFACE
+    eventLog.BorderSizePixel = 0
+    eventLog.ScrollBarThickness = 4
+    eventLog.CanvasSize = UDim2.new()
+    eventLog.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    eventLog.Parent = logTab
+    corner(eventLog, UDim.new(0, 10))
+    local eventLayout = Instance.new("UIListLayout")
+    eventLayout.Padding = UDim.new(0, 1)
+    eventLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    eventLayout.Parent = eventLog
+    local eventPad = Instance.new("UIPadding")
+    eventPad.PaddingTop = UDim.new(0, 6)
+    eventPad.PaddingBottom = UDim.new(0, 6)
+    eventPad.PaddingLeft = UDim.new(0, 10)
+    eventPad.PaddingRight = UDim.new(0, 10)
+    eventPad.Parent = eventLog
+    ui.EventLog = eventLog
+
+    local EVENT_LIMIT = 60
+    local eventOrder = 0
+    local function pushLog(message)
+        if not message or message == "" then return end
+        eventOrder = eventOrder + 1
+        local line = makeLabel(eventLog, ("[%s] %s"):format(os.date("%H:%M:%S"), message),
+            UDim2.new(1, 0, 0, 14), UDim2.fromOffset(0, 0), 10, TEXT_SUB, Enum.Font.Code)
+        line.LayoutOrder = eventOrder
+
+        local rows = eventLog:GetChildren()
+        local count = 0
+        for _, child in ipairs(rows) do
+            if child:IsA("TextLabel") then count = count + 1 end
+        end
+        if count > EVENT_LIMIT then
+            for _, child in ipairs(rows) do
+                if child:IsA("TextLabel") then
+                    child:Destroy()
+                    break
+                end
+            end
+        end
+
+        task.defer(function()
+            eventLog.CanvasPosition = Vector2.new(0, math.max(0, eventLog.AbsoluteCanvasSize.Y))
+        end)
+    end
+    ui.PushLog = pushLog
+
+    -- ── PESTAÑA AJUSTES (toggles) ─────────────────────────────
+    local togglesTab = Instance.new("Frame")
+    togglesTab.Size = UDim2.new(1, 0, 1, 0)
+    togglesTab.BackgroundTransparency = 1
+    togglesTab.Visible = false
+    togglesTab.Parent = content
+
+    makeLabel(togglesTab, "Elegí qué categorías busca y optimiza el mejorador.",
+        UDim2.new(1, 0, 0, 16), UDim2.fromOffset(2, 0), 11, TEXT_SUB)
+
+    local toggleList = Instance.new("ScrollingFrame")
+    toggleList.Position = UDim2.fromOffset(0, 22)
+    toggleList.Size = UDim2.new(1, 0, 1, -22)
+    toggleList.BackgroundColor3 = BG_SURFACE
+    toggleList.BorderSizePixel = 0
+    toggleList.ScrollBarThickness = 4
+    toggleList.CanvasSize = UDim2.new()
+    toggleList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    toggleList.Parent = togglesTab
+    corner(toggleList, UDim.new(0, 10))
+    local toggleLayout = Instance.new("UIListLayout")
+    toggleLayout.Padding = UDim.new(0, 4)
+    toggleLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    toggleLayout.Parent = toggleList
+    local togglePad = Instance.new("UIPadding")
+    togglePad.PaddingTop = UDim.new(0, 8)
+    togglePad.PaddingBottom = UDim.new(0, 8)
+    togglePad.PaddingLeft = UDim.new(0, 10)
+    togglePad.PaddingRight = UDim.new(0, 10)
+    togglePad.Parent = toggleList
+
+    ui.ToggleAccents = {}
+    ui.ToggleSubtext = {}
+    for index, category in ipairs(CATEGORY_ORDER) do
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, 0, 0, 56)
+        row.BackgroundColor3 = BG_SURFACE
+        row.LayoutOrder = index
+        row.Parent = toggleList
+        corner(row, UDim.new(0, 10))
+        stroke(row, STROKE_COLOR, 1, 0.6)
+
+        local initialOn = diagnostic.Selected[category]
+
+        local accentBar = Instance.new("Frame")
+        accentBar.Size = UDim2.fromOffset(3, 32)
+        accentBar.AnchorPoint = Vector2.new(0, 0.5)
+        accentBar.Position = UDim2.new(0, 8, 0.5, 0)
+        accentBar.BackgroundColor3 = initialOn and ON_COLOR or OFF_COLOR
+        accentBar.BorderSizePixel = 0
+        accentBar.Parent = row
+        corner(accentBar, UDim.new(1, 0))
+        ui.ToggleAccents[category] = accentBar
+
+        makeLabel(row, CATEGORY_LABELS[category], UDim2.new(1, -100, 0, 18), UDim2.fromOffset(20, 9), 12, TEXT_MAIN, Enum.Font.GothamMedium)
+        local subtext = makeLabel(row, (initialOn and "Activado" or "Desactivado") .. " · 0 encontrados",
+            UDim2.new(1, -100, 0, 16), UDim2.fromOffset(20, 30), 10, TEXT_DIM)
+        ui.ToggleSubtext[category] = subtext
+
+        makeSwitch(row, UDim2.new(1, -60, 0.5, -12), initialOn, function(value)
+            diagnostic.Selected[category] = value
+            TweenService:Create(accentBar, TweenInfo.new(0.15), { BackgroundColor3 = value and ON_COLOR or OFF_COLOR }):Play()
+            local found = diagnostic.Counts[category] or 0
+            subtext.Text = (value and "Activado" or "Desactivado") .. " · " .. formatNumber(found) .. " encontrados"
+        end)
+    end
+
+    -- ── Navegación del rail ────────────────────────────────────
+    local logIcon, logIndicator = makeRailIcon("LOG", 1)
+    local settingsIcon, settingsIndicator = makeRailIcon("⚙", 2)
+
+    local function selectTab(name)
+        logTab.Visible = (name == "log")
+        togglesTab.Visible = (name == "toggles")
+
+        logIndicator.Visible = (name == "log")
+        settingsIndicator.Visible = (name == "toggles")
+
+        TweenService:Create(logIcon, TweenInfo.new(0.15), {
+            BackgroundColor3 = (name == "log") and BG_SURFACE2 or BG_SURFACE,
+            TextColor3 = (name == "log") and TEXT_MAIN or TEXT_DIM,
+        }):Play()
+        TweenService:Create(settingsIcon, TweenInfo.new(0.15), {
+            BackgroundColor3 = (name == "toggles") and BG_SURFACE2 or BG_SURFACE,
+            TextColor3 = (name == "toggles") and TEXT_MAIN or TEXT_DIM,
+        }):Play()
+    end
+    logIcon.MouseButton1Click:Connect(function() selectTab("log") end)
+    settingsIcon.MouseButton1Click:Connect(function() selectTab("toggles") end)
+    selectTab("log")
+
+    -- ── Botonera de acciones (estilo Vaystrap: ícono + texto) ──
+    local footer = Instance.new("Frame")
+    footer.Size = UDim2.new(1, -16, 0, FOOTER_H - 8)
+    footer.Position = UDim2.new(0, 8, 1, -FOOTER_H + 4)
+    footer.BackgroundTransparency = 1
+    footer.Parent = panel
+
+    local scan = makeTextButton(footer, "▶  INICIAR ESCANEO", UDim2.new(1, 0, 0, 38), UDim2.fromOffset(0, 0), Color3.fromRGB(232, 235, 242))
+    scan.TextColor3 = Color3.fromRGB(18, 18, 20)
+    local apply = makeTextButton(footer, "✓  APLICAR", UDim2.new(0.5, -4, 0, 34), UDim2.fromOffset(0, 46), Color3.fromRGB(38, 90, 60))
+    local restore = makeTextButton(footer, "↺  RESTAURAR", UDim2.new(0.5, -4, 0, 34), UDim2.new(0.5, 4, 0, 46), BG_SURFACE2)
+    ui.ScanButton = scan
+    ui.ApplyButton = apply
+    ui.RestoreButton = restore
+
+    local status = Instance.new("TextLabel")
+    status.Visible = false
+    status.Text = "Pulsa INICIAR ESCANEO para comenzar"
+    status.Parent = panel
+    ui.Status = status
+    ui.Status:GetPropertyChangedSignal("Text"):Connect(function()
+        pushLog(ui.Status.Text)
+    end)
+    pushLog("Panel listo. Pulsa INICIAR ESCANEO para comenzar.")
+
+    scan.MouseButton1Click:Connect(scanEnvironment)
+    apply.MouseButton1Click:Connect(applySelectedCategories)
+    restore.MouseButton1Click:Connect(function()
+        restoreAll()
+        updateStatus("Todo restaurado a los valores originales")
+    end)
+
+    -- ── Drag del panel (por el header) ─────────────────────────
+    local dragging = false
+    local dragStart
+    local startPos
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = panel.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+
+    -- ── Ícono flotante circular (estilo HideGuis) para abrir/cerrar el panel ──
+    local pill = Instance.new("Frame")
+    pill.Name = "TogglePill"
+    pill.Size = UDim2.fromOffset(56, 56)
+    pill.Position = UDim2.new(0, 20, 0, 60)
+    pill.BackgroundColor3 = BG_SURFACE
+    pill.BackgroundTransparency = 0.15
+    pill.BorderSizePixel = 0
+    pill.ZIndex = 2
+    pill.Parent = screen
+    corner(pill, UDim.new(1, 0))
+    applyGlassSweep(pill, YANG_COLOR, YANG_COLOR_B)
+
+    local pillLabel = makeLabel(pill, "YY", UDim2.new(1, 0, 1, 0), UDim2.fromOffset(0, 0), 16, TEXT_MAIN, Enum.Font.GothamBlack, Enum.TextXAlignment.Center)
+    pillLabel.ZIndex = 3
+
+    local pillBtn = Instance.new("TextButton")
+    pillBtn.Size = UDim2.new(1, 0, 1, 0)
+    pillBtn.BackgroundTransparency = 1
+    pillBtn.Text = ""
+    pillBtn.ZIndex = 4
+    pillBtn.Parent = pill
+
+    local pDragging, pMoved = false, false
+    local pOrigin, pPillOrigin = Vector2.zero, UDim2.new()
+    local THRESHOLD = 6
+
+    pillBtn.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch or inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            pDragging = true
+            pMoved = false
+            pOrigin = inp.Position
+            pPillOrigin = pill.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(inp)
+        if not pDragging then return end
+        if inp.UserInputType == Enum.UserInputType.Touch or inp.UserInputType == Enum.UserInputType.MouseMovement then
+            local d = inp.Position - pOrigin
+            if not pMoved and (math.abs(d.X) > THRESHOLD or math.abs(d.Y) > THRESHOLD) then
+                pMoved = true
+            end
+            if pMoved then
+                pill.Position = UDim2.new(pPillOrigin.X.Scale, pPillOrigin.X.Offset + d.X, pPillOrigin.Y.Scale, pPillOrigin.Y.Offset + d.Y)
+            end
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch or inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            if pDragging and not pMoved then
+                panel.Visible = not panel.Visible
+            end
+            pDragging = false
+            pMoved = false
+        end
+    end)
+
+    -- ── Loop de refresco del resumen (LOG): 0 lag — solo texto, cada 0.35s ──
+    task.spawn(function()
+        while myToken == uiLoopToken and screen.Parent do
+            local stats = getStats()
+            statsLabel.Text = ("Procesados %s · Cambiados %s · Restaurados %s · Pendientes %s")
+                :format(formatNumber(stats.Processed), formatNumber(stats.Changed), formatNumber(stats.Restored), formatNumber(stats.Pending))
+
+            for _, category in ipairs(CATEGORY_ORDER) do
+                local found = diagnostic.Counts[category] or 0
+                local changed = state.CategoryChanged[category] or 0
+                local summaryLbl = ui.SummaryRows[category]
+                if summaryLbl then
+                    summaryLbl.Text = formatNumber(found) .. " · " .. formatNumber(changed)
+                end
+                local subtextLbl = ui.ToggleSubtext[category]
+                if subtextLbl then
+                    local isOn = diagnostic.Selected[category]
+                    subtextLbl.Text = (isOn and "Activado" or "Desactivado") .. " · " .. formatNumber(found) .. " encontrados"
+                end
+            end
+            task.wait(0.35)
+        end
+    end)
+
+    screen.Destroying:Connect(function()
+        if myToken == uiLoopToken then
+            uiLoopToken = uiLoopToken + 1
+        end
+    end)
+end
+
+local inputConnection = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then
+        return
+    end
+    if input.KeyCode == Enum.KeyCode.F6 then
+        if ui.Panel then ui.Panel.Visible = not ui.Panel.Visible end
+    elseif input.KeyCode == Enum.KeyCode.F7 then
+        restoreAll()
+        updateStatus("Todo restaurado a los valores originales")
+    elseif input.KeyCode == Enum.KeyCode.F8 then
+        if diagnostic.Running then
+            updateStatus("Espera a que termine el escaneo")
+        elseif state.Enabled then
+            restoreAll()
+            updateStatus("Optimización desactivada y valores restaurados")
+        else
+            applySelectedCategories()
+        end
+    end
+end)
+
+GEN[API_NAME] = {
+    Config = CONFIG,
+    Apply = function(profileName)
+        return applyProfile(profileName or CONFIG.DefaultProfile)
+    end,
+    ApplySelected = applySelectedCategories,
+    Scan = scanEnvironment,
+    Restore = function()
+        restoreAll()
+        updateStatus("Todo restaurado a los valores originales")
+    end,
+    Toggle = toggle,
+    Stats = function()
+        local result = getStats()
+        result.ScanRunning = diagnostic.Running
+        result.ScanTotal = diagnostic.Total
+        result.CategoryCounts = diagnostic.Counts
+        result.CategoryChanged = state.CategoryChanged
+        return result
+    end,
+    Shutdown = function()
+        restoreAll()
+        if inputConnection then
+            pcall(function()
+                inputConnection:Disconnect()
+            end)
+        end
+        uiLoopToken = uiLoopToken + 1
+        if ui.ScreenGui then
+            ui.ScreenGui:Destroy()
+            ui.ScreenGui = nil
+        end
+        GEN[API_NAME] = nil
+    end,
+}
+
+makePanel()
+print("YinYang Performance PRO v3: rail de íconos + tamaño responsive real — F6/F7/F8 disponibles")
+
+
+return function()
+    if GEN[API_NAME] and type(GEN[API_NAME].Shutdown) == "function" then
+        pcall(GEN[API_NAME].Shutdown)
+    end
+end
+
+end
+
 local ModuleFactories = {
     HideGuis = registerHideGuis,
     FOVAdjust = registerFOVAdjust,
     Waypoint = registerWaypoint,
+    PerformanceOptimizer = registerPerformanceOptimizer,
 }
 
 local activeStops = {}
