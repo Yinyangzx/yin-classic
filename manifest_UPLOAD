@@ -23,4 +23,10 @@ return {
         file = "YinYang_ClassicOptions.lua",
         key = "PerformanceOptimizer",
     },
+    {
+        es = "Estadísticas (FPS/Ping)",
+        en = "Stats (FPS/Ping)",
+        file = "YinYang_ClassicOptions.lua",
+        key = "StatsHUD",
+    },
 }
