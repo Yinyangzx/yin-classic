@@ -2391,11 +2391,284 @@ end
 
 end
 
+local function registerStatsHUD()
+-- StatsHUD — FPS / Ping / Timer, mismo sistema de efectos que HideGuis
+print("[StatsHUD] Iniciando...")
+-- Base: HideGuis-7.lua (gradiente glassy + UIStroke con sweep+pulse)
+-- Adaptado: rectángulo ancho (no pill), negro, borde blanco, sweep rojo ancho y lento
+
+local Players       = game:GetService("Players")
+local UIS           = game:GetService("UserInputService")
+local TweenService  = game:GetService("TweenService")
+local RunService    = game:GetService("RunService")
+local StatsService  = game:GetService("Stats")
+local lp            = Players.LocalPlayer
+local pg            = lp:WaitForChild("PlayerGui")
+
+-- Limpiar instancia previa
+local prev = pg:FindFirstChild("_StatsHUD")
+if prev then prev:Destroy() end
+
+-- ── Paleta (según pedido: fondo negro, borde blanco, sweep rojo) ──
+local BG          = Color3.fromRGB(0, 0, 0)      -- negro
+local BORDER      = Color3.fromRGB(255, 255, 255) -- blanco (borde estático)
+local SWEEP_BASE  = Color3.fromRGB(255, 40, 40)   -- rojo (base del efecto que gira)
+
+-- ── ScreenGui ─────────────────────────────────────────────────
+local gui = Instance.new("ScreenGui")
+gui.Name           = "_StatsHUD"
+gui.ResetOnSpawn   = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder   = 9999
+
+-- Usa gethui() si está disponible (evita que el ejecutor bloquee silenciosamente
+-- el parenting a PlayerGui). Fallback a PlayerGui igual que la librería Zin.
+local guiParent = pg
+pcall(function()
+    if typeof(gethui) == "function" then
+        local hidden = gethui()
+        if hidden then guiParent = hidden end
+    end
+end)
+-- Synapse X / Wave: protect_gui evita que el juego destruya la GUI
+pcall(function()
+    if typeof(syn) == "table" and typeof(syn.protect_gui) == "function" then
+        syn.protect_gui(gui)
+    end
+end)
+gui.Parent = guiParent
+print("[StatsHUD] GUI parented a:", tostring(guiParent))
+
+-- ── Panel principal (rectángulo ancho, no pill) ────────────────
+local panel = Instance.new("Frame")
+panel.Size                   = UDim2.fromOffset(230, 58)
+panel.Position               = UDim2.new(0, 20, 0, 60)
+panel.BackgroundColor3       = BG
+panel.BackgroundTransparency = 0.5   -- "medio transparente"
+panel.BorderSizePixel        = 0
+panel.ZIndex                 = 2
+panel.Parent                 = gui
+
+local panelCorner = Instance.new("UICorner")
+panelCorner.CornerRadius = UDim.new(0, 14)  -- rectángulo redondeado, no cápsula
+panelCorner.Parent       = panel
+
+-- UIGradient glassy (mismo patrón que HideGuis, sin cambios de color)
+local glassy = Instance.new("UIGradient")
+glassy.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   Color3.fromRGB(60,  60,  65)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(90,  90,  95)),
+    ColorSequenceKeypoint.new(1,   Color3.fromRGB(60,  60,  65)),
+})
+glassy.Transparency = NumberSequence.new({
+    NumberSequenceKeypoint.new(0,   0.55),
+    NumberSequenceKeypoint.new(0.5, 0.25),
+    NumberSequenceKeypoint.new(1,   0.55),
+})
+glassy.Rotation = 90
+glassy.Parent   = panel
+
+-- UIStroke: base blanca estática + gradiente rojo animado encima
+local stroke = Instance.new("UIStroke")
+stroke.Thickness    = 2.5
+stroke.Color        = BORDER   -- "bordes blancos"
+stroke.Transparency = 0.10
+stroke.LineJoinMode = Enum.LineJoinMode.Round
+stroke.Parent       = panel
+
+-- ── Gradiente del sweep: ANCHO (banda amplia, no un pico fino) ──
+local h, s, v      = Color3.toHSV(SWEEP_BASE)
+local sweepLight   = Color3.fromHSV(h, math.max(0, s - 0.25), math.min(1, v + 0.15))
+local sweepDark    = Color3.fromHSV(h, math.min(1, s + 0.1),  math.max(0, v - 0.35))
+
+local strokeGrad = Instance.new("UIGradient")
+-- 5 keypoints en vez de 3: crea una meseta ancha en vez de un pico fino
+strokeGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,    sweepDark),
+    ColorSequenceKeypoint.new(0.35, sweepLight),
+    ColorSequenceKeypoint.new(0.5,  sweepLight),
+    ColorSequenceKeypoint.new(0.65, sweepLight),
+    ColorSequenceKeypoint.new(1,    sweepDark),
+})
+strokeGrad.Transparency = NumberSequence.new({
+    NumberSequenceKeypoint.new(0,    0.5),
+    NumberSequenceKeypoint.new(0.35, 0.0),
+    NumberSequenceKeypoint.new(0.5,  0.0),
+    NumberSequenceKeypoint.new(0.65, 0.0),
+    NumberSequenceKeypoint.new(1,    0.5),
+})
+strokeGrad.Offset = Vector2.new(-1.5, 0)
+strokeGrad.Parent = stroke
+
+-- Sweep MÁS LENTO: 1.4s (HideGuis) → 3.6s
+TweenService:Create(
+    strokeGrad,
+    TweenInfo.new(3.6, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false),
+    { Offset = Vector2.new(1.5, 0) }
+):Play()
+
+-- Pulse (igual patrón que HideGuis, levemente más lento para acompañar el sweep)
+TweenService:Create(
+    stroke,
+    TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+    { Transparency = 0.0 }
+):Play()
+
+-- ── Labels (2 líneas: FPS/Ping arriba, Timer abajo) ────────────
+local lineTop = Instance.new("TextLabel")
+lineTop.Size               = UDim2.new(1, -12, 0, 20)
+lineTop.Position           = UDim2.new(0, 6, 0, 8)
+lineTop.BackgroundTransparency = 1
+lineTop.Text               = "FPS: -- | Ping: -- ms"
+lineTop.TextColor3         = Color3.fromRGB(240, 240, 240)
+lineTop.Font               = Enum.Font.GothamBlack
+lineTop.TextSize           = 14
+lineTop.TextXAlignment     = Enum.TextXAlignment.Center
+lineTop.ZIndex             = 3
+lineTop.Parent             = panel
+
+local lineBottom = Instance.new("TextLabel")
+lineBottom.Size               = UDim2.new(1, -12, 0, 18)
+lineBottom.Position           = UDim2.new(0, 6, 0, 30)
+lineBottom.BackgroundTransparency = 1
+lineBottom.Text               = "Client Timer: 0h 0m 0s"
+lineBottom.TextColor3         = Color3.fromRGB(220, 220, 220)
+lineBottom.Font               = Enum.Font.GothamBold
+lineBottom.TextSize           = 12
+lineBottom.TextXAlignment     = Enum.TextXAlignment.Center
+lineBottom.ZIndex             = 3
+lineBottom.Parent             = panel
+
+-- ── Botón invisible encima (solo para el drag, sin acción de tap) ──
+local btn = Instance.new("TextButton")
+btn.Size                 = UDim2.new(1, 0, 1, 0)
+btn.BackgroundTransparency = 1
+btn.Text                 = ""
+btn.ZIndex               = 4
+btn.Parent               = panel
+
+-- ── Medición de FPS ──────────────────────────────────────────
+-- Contador de frames por ventana de tiempo (evita el ruido de 1/dt por frame)
+local frameCount   = 0
+local fpsWindowT   = 0
+local currentFPS   = 0
+local FPS_SAMPLE_INTERVAL = 0.5
+
+local renderConn = RunService.RenderStepped:Connect(function(dt)
+    frameCount = frameCount + 1
+    fpsWindowT = fpsWindowT + dt
+    if fpsWindowT >= FPS_SAMPLE_INTERVAL then
+        currentFPS = math.floor((frameCount / fpsWindowT) + 0.5)
+        frameCount = 0
+        fpsWindowT = 0
+    end
+end)
+
+-- ── Medición de Ping ─────────────────────────────────────────
+-- API real de Roblox: Stats.Network.ServerStatsItem["Data Ping"]
+-- Envuelto en pcall: algunos ejecutadores restringen el servicio Stats
+local function getPing()
+    local ok, ms = pcall(function()
+        return StatsService.Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    if ok and ms then
+        return math.floor(ms + 0.5)
+    end
+    return nil
+end
+
+-- ── Timer de ejecución ───────────────────────────────────────
+local startTime = tick()
+
+local function formatElapsed(seconds)
+    local h = math.floor(seconds / 3600)
+    local m = math.floor((seconds % 3600) / 60)
+    local s = math.floor(seconds % 60)
+    return string.format("%dh %dm %ds", h, m, s)
+end
+
+-- ── Loop de actualización de texto (cada 0.5s) ────────────────
+task.spawn(function()
+    while panel.Parent do
+        local ping = getPing()
+        local pingText = ping and (ping .. " ms") or "N/A"
+
+        lineTop.Text    = string.format("FPS: %d | Ping: %s", currentFPS, pingText)
+        lineBottom.Text = "Client Timer: " .. formatElapsed(tick() - startTime)
+
+        task.wait(0.5)
+    end
+end)
+
+-- Limpiar la conexión de RenderStepped si el HUD se destruye
+gui.AncestryChanged:Connect(function(_, parent)
+    if not parent then
+        renderConn:Disconnect()
+    end
+end)
+
+-- ── Drag con threshold (idéntico a HideGuis) ──────────────────
+local dragging   = false
+local moved      = false
+local dragOrigin = Vector2.zero
+local panelOrigin = UDim2.new()
+local THRESHOLD  = 6
+
+btn.InputBegan:Connect(function(inp)
+    if inp.UserInputType == Enum.UserInputType.Touch
+    or inp.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging    = true
+        moved       = false
+        dragOrigin  = inp.Position
+        panelOrigin = panel.Position
+    end
+end)
+
+UIS.InputChanged:Connect(function(inp)
+    if not dragging then return end
+    if inp.UserInputType == Enum.UserInputType.Touch
+    or inp.UserInputType == Enum.UserInputType.MouseMovement then
+        local d = inp.Position - dragOrigin
+        if not moved and (math.abs(d.X) > THRESHOLD or math.abs(d.Y) > THRESHOLD) then
+            moved = true
+        end
+        if moved then
+            panel.Position = UDim2.new(
+                panelOrigin.X.Scale, panelOrigin.X.Offset + d.X,
+                panelOrigin.Y.Scale, panelOrigin.Y.Offset + d.Y
+            )
+        end
+    end
+end)
+
+UIS.InputEnded:Connect(function(inp)
+    if inp.UserInputType == Enum.UserInputType.Touch
+    or inp.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+        moved    = false
+    end
+end)
+
+print("[StatsHUD] ✅ Listo — HUD activo")
+
+-- ════════════════════════════════════════════════════════════════════════
+-- REGISTRO DE FUNCIÓN DE PARADA — requerido por el sistema de scripts externos
+-- La librería llama a _G["_YY_STOP_StatsHUD"]() al presionar el botón por segunda vez.
+-- Destruye la GUI; el loop de texto y la conexión de FPS se autolimpian solos
+-- (panel.Parent pasa a nil, y gui.AncestryChanged desconecta renderConn).
+-- ════════════════════════════════════════════════════════════════════════
+return function()
+    pcall(function() gui:Destroy() end)
+end
+
+end
+
 local ModuleFactories = {
     HideGuis = registerHideGuis,
     FOVAdjust = registerFOVAdjust,
     Waypoint = registerWaypoint,
     PerformanceOptimizer = registerPerformanceOptimizer,
+    StatsHUD = registerStatsHUD,
 }
 
 local activeStops = {}
